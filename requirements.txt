@@ -1,0 +1,5 @@
+pyTelegramBotAPI==4.16.1
+pytz==2024.1
+celery==5.3.6
+SQLAlchemy==2.0.29
+celery-sqlalchemy-scheduler==0.3.0
