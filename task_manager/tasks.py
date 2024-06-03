@@ -1,10 +1,21 @@
 import time
 import logging
 import configparser
+from datetime import datetime, timedelta
 
+# Project
 import config
-from task_manager.celery_config import celery_app
-from core.managers import service_keeper, ChatManager
+from core.managers import ChatManager, service_keeper
+
+from . import celery_app
+
+__all__ = [
+    "terminate_idle_task",
+    "reload_messages_task",
+    "send_reminder_task",
+    "refill_balance_task",
+    "annul_balance_task",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +63,11 @@ def reload_messages_task():
 
 
 @celery_app.task
-def send_reminder_task(chat_id):
-    ...
-    # TODO: Use bot to send reminder to a particular chat
+def send_reminder_task(chat_id: int):
+    manager = ChatManager(chat_id)
+    if not manager.reminder_silenced:
+        ...
+        # TODO send reminder...
     logger.info(f"Reminder sent to {chat_id=}")
 
 
@@ -62,6 +75,7 @@ def send_reminder_task(chat_id):
 def refill_balance_task(chat_id: int):
     manager = ChatManager(chat_id)
     manager.top_up()
+    manager.reset_reminder()
     logger.info(f"Balance refilled for {chat_id=}")
 
 

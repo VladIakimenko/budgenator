@@ -1,12 +1,19 @@
-import enum
-import uuid
-import decimal
+from __future__ import annotations
+
 import datetime
+from enum import Enum
+from uuid import UUID, uuid4
 from typing import Annotated
+from decimal import Decimal
 
-from sqlalchemy import Numeric, ForeignKey, text, func, JSON
-from sqlalchemy.orm import Mapped, mapped_column, declarative_base
-
+from sqlalchemy import UUID as UUIDType
+from sqlalchemy import Integer, Numeric, ForeignKey, func, text
+from sqlalchemy.orm import (Mapped,
+                            relationship,
+                            declared_attr,
+                            mapped_column,
+                            declarative_base,)
+from sqlalchemy.ext.declarative import AbstractConcreteBase
 from celery_sqlalchemy_scheduler.models import PeriodicTask, CrontabSchedule
 
 __all__ = [
@@ -27,7 +34,7 @@ Base = declarative_base()
 
 
 # enum
-class DayOfTheWeek(str, enum.Enum):
+class DayOfTheWeek(Enum):
     MONDAY = "MONDAY", 1, False
     TUESDAY = "TUESDAY", 2, False
     WEDNESDAY = "WEDNESDAY", 3, False
@@ -37,42 +44,48 @@ class DayOfTheWeek(str, enum.Enum):
     SUNDAY = "SUNDAY", 7, True
 
     def __new__(cls, value, ordinal_number: int, is_weekend: bool = False):
-        obj = str.__new__(cls, value)
+        obj = object.__new__(cls)
         obj._value_ = value
         obj.ordinal_number = ordinal_number
         obj.is_weekend = is_weekend
         return obj
 
 
-class ScheduleBasis(str, enum.Enum):
+class ScheduleBasis(Enum):
     DAILY = "DAILY"
     DAY_OF_THE_WEEK = "DAY_OF_THE_WEEK"
     DAY_OF_THE_MONTH = "DAY_OF_THE_MONTH"
 
 
-class EventType(str, enum.Enum):
-    REPLENISHMENT = "REPLENISHMENT", "task_manager.tasks.refill_balance", True
-    ANNULMENT = "ANNULMENT", "task_manager.tasks.annul_balance", True
-    REMINDER = "REMINDER", "task_manager.tasks.send_reminder", True
-    IDLE_CHATS_TERMINATION = "IDLE_CHATS_TERMINATION", "task_manager.tasks.terminate_idle"
+class EventType(Enum):
+    REPLENISHMENT = "REPLENISHMENT", "task_manager.celery_config.refill_balance_task", True
+    ANNULMENT = "ANNULMENT", "task_manager.celery_config.annul_balance_task", True
+    REMINDER = "REMINDER", "task_manager.celery_config.send_reminder_task", True
 
     def __new__(
         cls,
         value,
         task: str,
+        model: Base,
         requires_chat_id: bool = False,
     ):
-        obj = str.__new__(cls, value)
+        obj = object.__new__(cls)
         obj._value_ = value
         obj.task = task
+        obj.model = model
         obj.requires_chat_id = requires_chat_id
         return obj
 
 
-class State(str, enum.Enum):
+class State(Enum):
     INITIAL = "INITIAL"
     CONFIGURED = "CONFIGURED"
     TERMINATED = "TERMINATED"
+
+
+class AnnulmentCondition(Enum):
+    ...
+    # TODO
 
 
 # dto
@@ -135,12 +148,14 @@ class Chat(Base):
         default=datetime.datetime.now(),
         server_default=text("CURRENT_TIMESTAMP"),
     )
-    schedule_ids: Mapped[list] = mapped_column(JSON, default=[], server_default=text("[]"))
-    task_ids: Mapped[list] = mapped_column(JSON, default=[], server_default=text("[]"))
+
+    # relations
+    budget: Mapped[Budget] = relationship(back_populates="chat")
+    events: Mapped[list[Event]] = relationship(back_populates="chat")
 
 
 money = Annotated[
-    decimal.Decimal,
+    Decimal,
     mapped_column(
         Numeric(precision=10, scale=2), default=0.00, server_default=text("0.00")
     ),
@@ -149,15 +164,82 @@ money = Annotated[
 
 class Budget(Base):
     __tablename__ = "budget"
-    budget_id: Mapped[uuid.UUID] = mapped_column(
+    budget_id: Mapped[UUID] = mapped_column(
         primary_key=True,
-        default=uuid.uuid4(),
+        default=uuid4(),
         server_default=func.gen_random_uuid(),
     )
     # We assign budgets to chats, rather than users, to allow using one budget in a group chat
-    chat_id: Mapped[int] = mapped_column(ForeignKey(Chat.chat_id))
+    chat_id: Mapped[int] = mapped_column(
+        ForeignKey(Chat.chat_id, onupdate="CASCADE", ondelete="CASCADE"))
     balance: Mapped[money]
-    replenishment: Mapped[money]
+
+    # relations
+    chat: Mapped[Chat] = relationship(back_populates="budget")
+
+
+class Event(AbstractConcreteBase, Base):
+    strict_attrs = True
+
+    @declared_attr
+    def event_id(cls):
+        return mapped_column(
+            UUIDType,
+            primary_key=True,
+            default=uuid4(),
+            server_default=func.gen_random_uuid(),
+        )
+
+    @declared_attr
+    def chat_id(cls):
+        return mapped_column(
+            Integer,
+            ForeignKey(Chat.chat_id, onupdate="CASCADE", ondelete="CASCADE"),
+            nullable=False,
+        )
+
+    @declared_attr
+    def schedule_id(cls):
+        return mapped_column(Integer, nullable=False)
+
+    @declared_attr
+    def task_id(cls):
+        return mapped_column(Integer, nullable=False)
+
+    # relations
+    @declared_attr
+    def chat(cls):
+        return relationship(Chat, back_populates="events")
+
+
+class ReplenishmentEvent(Event):
+    __tablename__ = 'replenishment'
+    size: Mapped[money]
+
+    __mapper_args__ = {
+        'polymorphic_identity': EventType.REPLENISHMENT.value,
+        'concrete':True
+    }
+
+
+class ReminderEvent(Event):
+    __tablename__ = 'reminder'
+    silenced: Mapped[bool] = mapped_column(default=False, server_default="FALSE")
+
+    __mapper_args__ = {
+        'polymorphic_identity': EventType.REMINDER.value,
+        'concrete': True
+    }
+
+
+class AnnulmentEvent(Event):
+    __tablename__ = 'annulment'
+    condition: Mapped[AnnulmentCondition | None] = mapped_column(default=None, server_default="NULL")
+
+    __mapper_args__ = {
+        'polymorphic_identity': EventType.ANNULMENT.value,
+        'concrete': True
+    }
 
 
 class Message(Base):

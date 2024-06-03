@@ -12,8 +12,8 @@ python init_db.py
 
 # Celery
 ```
-celery worker -A task_manager.celery_config
-$ celery beat -A task_manager.celery_config -S celery_sqlalchemy_scheduler.schedulers:DatabaseScheduler
+celery -A task_manager.celery_config worker
+celery -A task_manager.celery_config beat -S celery_sqlalchemy_scheduler.schedulers:DatabaseScheduler
 ```
 
 # Requirements

@@ -1,15 +1,15 @@
-import configparser
 import logging
+import configparser
 import logging.config as logging_config
-
-from celery_sqlalchemy_scheduler.session import ModelBase as ScheduleBase
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from celery_sqlalchemy_scheduler.session import ModelBase as ScheduleBase
 
 # Project
 import config
-from core.models import Base as CoreBase, Message
+from core.models import Base as CoreBase
+from core.models import Message
 
 logging_config.fileConfig('logging.ini')
 logger = logging.getLogger(__name__)

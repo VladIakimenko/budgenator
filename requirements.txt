@@ -1,6 +1,7 @@
 pyTelegramBotAPI==4.16.1
+git+https://github.com/VladIakimenko/celery-sqlalchemy-scheduler.git
 pytz==2024.1
 celery==5.3.6
 SQLAlchemy==2.0.29
-celery-sqlalchemy-scheduler==0.3.0
 Faker==24.11.0
+redis==5.0.4

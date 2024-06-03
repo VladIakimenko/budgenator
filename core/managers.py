@@ -3,25 +3,26 @@ from __future__ import annotations
 import decimal
 import logging
 import functools
+from json import dumps
 from typing import Callable
 from datetime import datetime, timedelta
 
 from sqlalchemy import delete, select, update
+from sqlalchemy.exc import DatabaseError
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.orm.attributes import flag_modified
 
+# Project
 import config
-from core.models import (
-    Chat,
-    State,
-    Budget,
-    Message,
-    PeriodicTask,
-    ScheduleBasis,
-    ScheduleEntry,
-    CrontabSchedule,
-)
-from core.utils import generate_trace_phrase, singleton
+from core.utils import generate_trace_phrase
+from core.models import (Chat,
+                         Event,
+                         State,
+                         Budget,
+                         Message,
+                         PeriodicTask,
+                         ScheduleBasis,
+                         ScheduleEntry,
+                         CrontabSchedule,)
 
 __all__ = [
     "ChatManager",
@@ -32,7 +33,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-class ManagerFactory(type):
+class ExceptionsHandlerMeta(type):
     """
     A custom metaclass designed to secure managers' methods execution
     by wrapping each method into a try-except block with robust exception handling.
@@ -50,7 +51,7 @@ class ManagerFactory(type):
             try:
                 return method(self, *args, **kwargs)
             except Exception as e:
-                instance = args[0]
+                instance = self
                 log_message = (
                     f"\n"
                     f"\tException occurred during the '{type(instance).__name__}.{method.__name__}' execution:\n"
@@ -63,6 +64,7 @@ class ManagerFactory(type):
                 # inform user that there was an error
                 chat_id = self.chat_id
                 if chat_id is not None:
+                    # Project
                     from main import telegram_bot
 
                     trace_phrase = generate_trace_phrase()
@@ -70,56 +72,45 @@ class ManagerFactory(type):
                     text = service_keeper.get_message("error", "info")
                     contacts = service_keeper.get_message("error", "contacts")
                     text = "\n".join([text, trace_phrase, contacts])
-                    telegram_bot.send_message(chat_id=chat_id, text=text)
+                    telegram_bot.telebot.send_message(chat_id=chat_id, text=text)
                 # log the exception
                 logger.error(log_message)
         return wrapped
 
 
-class ChatManager(metaclass=ManagerFactory):
+class ChatManager(metaclass=ExceptionsHandlerMeta):
     db_session = sessionmaker(bind=config.core_engine)()
 
     def __init__(self, chat_id: int):
         self.chat_id = chat_id
-        self.schedule_manager = ScheduleManager(chat_manager=self)
+        self.scheduler = Scheduler(chat_manager=self)
 
-    def _check_state(self) -> bool:
+    def get_state(self) -> State:
         state = self.db_session.execute(
             select(Chat.state).where(Chat.chat_id == self.chat_id)
         ).scalar()
-        match state:
-            case State.CONFIGURED:
-                return True
-            case State.INITIAL:
-                # TODO: send message, that configuration is required for this operation
-                logger.info(
-                    f"BudgetController._state_check failed. "
-                    f"The chat with {self.chat_id=} is not configured. "
-                    f"The user has been informed"
-                )
-                return False
+        if state == State.TERMINATED:
+            logger.info(f"Attempt to revoke the terminated chat with {self.chat_id=}.")
+        return state
 
-            case State.TERMINATED:
-                # TODO: send message, that the budget accounting has been seized, remove the chat and start a new one
-                logger.info(
-                    f"Attempt to revoke the terminated chat with {self.chat_id=}. "
-                    f"The user has been advised to start a new one"
-                )
-                return False
+    def set_configured(self) -> None:
+        chat = self.db_session.get(Chat, self.chat_id)
+        if chat.state == State.INITIAL:
+            chat.state = State.CONFIGURED
+            self.db_session.commit()
+            logger.info(f"The state of the chat with chat_id {self.chat_id} is set to {State.CONFIGURED.value}.")
 
     def engage(
         self,
-        replenishment: decimal.Decimal,
         start_balance: decimal.Decimal = None,
     ) -> None:
         chat = Chat()
         chat.chat_id = self.chat_id
-        chat.latest_msg_received_at = datetime.now()
+        chat.latest_contact = datetime.now()
 
         budget = Budget()
         budget.chat_id = self.chat_id
-        budget.replenishment = replenishment
-        if start_balance:
+        if start_balance is not None:
             budget.balance = start_balance
 
         chat.budget = budget
@@ -128,16 +119,12 @@ class ChatManager(metaclass=ManagerFactory):
         self.db_session.commit()
 
     def get_balance(self) -> decimal.Decimal | None:
-        if not self._check_state():
-            return
         return self.db_session.execute(
             select(Budget.balance)
             .where(Budget.chat_id == self.chat_id)
         ).scalar()
 
     def spend(self, amount: decimal.Decimal) -> None:
-        if not self._check_state():
-            return
         self.db_session.execute(
             update(Budget)
             .where(Budget.chat_id == self.chat_id)
@@ -146,33 +133,18 @@ class ChatManager(metaclass=ManagerFactory):
         self.db_session.commit()
 
     def top_up(self, amount: decimal.Decimal = None) -> None:
-        if not self._check_state():
-            return
-        replenishment = amount or Budget.replenishment
         self.db_session.execute(
             update(Budget)
             .where(Budget.chat_id == self.chat_id)
-            .values(balance=Budget.balance + replenishment)
+            .values(balance=Budget.balance + amount)
         )
         self.db_session.commit()
 
     def annul(self) -> None:
-        if not self._check_state():
-            return
         self.db_session.execute(
             update(Budget)
             .where(Budget.chat_id == self.chat_id)
             .values(balance=0)
-        )
-        self.db_session.commit()
-
-    def change_replenishment(self, size: decimal.Decimal):
-        if not self._check_state():
-            return
-        self.db_session.execute(
-            update(Budget)
-            .where(Budget.chat_id == self.chat_id)
-            .values(replenishment=size)
         )
         self.db_session.commit()
 
@@ -184,33 +156,20 @@ class ChatManager(metaclass=ManagerFactory):
         )
         self.db_session.commit()
 
-    def set_configured(self) -> None:
-        self.db_session.execute(
-            update(Chat)
-            .where(Chat.chat_id == self.chat_id)
-            .values(state=State.CONFIGURED)
+    def add_event(self, record: ScheduleEntry, **kwargs) -> None:
+        schedule, task = self.scheduler.schedule_crontab_task(record)
+        event = Event(
+            event_type=record.event_type,
+            chat_id=self.chat_id,
+            schedule_id=schedule.id,
+            task_id=task.id,
+            **kwargs    # used for concrete event-specific fields
         )
-        self.db_session.commit()
-
-    def set_terminated(self) -> None:
-        self.db_session.execute(
-            update(Chat)
-            .where(Chat.chat_id == self.chat_id)
-            .values(state=State.TERMINATED)
-        )
-        # TODO add relevant objects removal
-        self.db_session.commit()
-
-    def add_scheduler_objects_pair(self, scheduler_id: int, task_id: int) -> None:
-        chat = self.db_session.get(Chat, self.chat_id)
-        chat.schedule_ids.append(scheduler_id)
-        flag_modified(chat, "schedule_ids")
-        chat.task_ids.append(task_id)
-        flag_modified(chat, "task_ids")
+        self.db_session.add(event)
         self.db_session.commit()
 
 
-class ScheduleManager(metaclass=ManagerFactory):
+class Scheduler(metaclass=ExceptionsHandlerMeta):
     db_session = sessionmaker(bind=config.schedule_engine)()
 
     def __init__(self, chat_manager: ChatManager):
@@ -218,8 +177,8 @@ class ScheduleManager(metaclass=ManagerFactory):
         self.chat_id = chat_manager.chat_id
 
     def schedule_crontab_task(
-        self, record: ScheduleEntry, chat_id: int = None
-    ) -> None:
+        self, record: ScheduleEntry
+    ) -> tuple[CrontabSchedule, PeriodicTask]:
         """
         Uses ScheduleEntry objects to schedule crontab-based events
         (the events that are appointed to certain time, weekdays or monthdays)
@@ -230,12 +189,7 @@ class ScheduleManager(metaclass=ManagerFactory):
         task: str path to the task definition, like 'task_manager.tasks.sample_task'
         chat_id: int chat_id derived from pyTelegramBotAPI
         """
-        if chat_id is None and record.event_type.requires_chat_id:
-            raise TypeError(
-                f"The events of type {record.event_type} require the 'chat_id' to be scheduled"
-            )
 
-        # create schedule db objects
         crontab_schedule = CrontabSchedule()
         crontab_schedule.minute = record.time.minute
         crontab_schedule.hour = record.time.hour
@@ -246,74 +200,65 @@ class ScheduleManager(metaclass=ManagerFactory):
         crontab_schedule.timezone = config.TIMEZONE
 
         periodic_task = PeriodicTask()
-        periodic_task.name = f"{record.event_type}_{chat_id}"
+        periodic_task.name = f"{record.event_type.value}_{self.chat_id}_{datetime.now().timestamp()}"
         periodic_task.task = record.event_type.task
         periodic_task.crontab = crontab_schedule
+        periodic_task.args = dumps([self.chat_id])
 
         self.db_session.add_all([crontab_schedule, periodic_task])
         self.db_session.commit()
-
-        # assign the schedule db objects' ids to the chat
-        if record.event_type.requires_chat_id:
-            self.db_session.refresh(crontab_schedule)
-            self.db_session.refresh(periodic_task)
-            self.chat_manager.add_scheduler_objects_pair(crontab_schedule.id, periodic_task.id)
+        self.db_session.refresh(crontab_schedule)
+        self.db_session.refresh(periodic_task)
+        return crontab_schedule, periodic_task
 
 
-@singleton
 class ServiceKeeper:
     core_session = sessionmaker(bind=config.core_engine)()
     schedule_session = sessionmaker(bind=config.schedule_engine)()
 
-    def collect_ids_for_termination(self) -> tuple[list[int], list[int], list[int]]:
+    def terminate_idle(self):
         """
-        Collects the ids of all database objects that need to be cleared for the abandoned chats.
+        Deletes all db objects that need to be cleared for the abandoned chats,
+        sets the chat's state to 'TERMINATED'
         """
+        logger.info(f"Starting terminating idle chats...")
         data = self.core_session.execute(
-            select(Chat.chat_id, Chat.schedule_ids, Chat.task_ids)
+            select(
+                Chat.chat_id,
+                Budget.budget_id,
+                Event.event_id,
+                Event.schedule_id,
+                Event.task_id,
+            )
+            .select_from(Chat)
+            .outerjoin(Chat.budget)
+            .outerjoin(Chat.events)
             .where(datetime.now() - Chat.latest_contact > timedelta(days=config.MAX_IDLE_DAYS))
-        ).all()
-        chat_ids = []
-        schedule_ids = []
-        tasks_ids = []
-        if data:
-            for row in data:
-                chat_ids.append(row[0])
-                schedule_ids.extend(row[1])
-                tasks_ids.extend(row[2])
-        return chat_ids, schedule_ids, tasks_ids
+        ).fetchall()
+        if not data:
+            logger.info("No chats need to be terminated")
+            return
+        chat_ids, budget_ids, event_ids, schedule_ids, task_ids = zip(*data)
+        self.core_session.execute(update(Chat).where(Chat.chat_id.in_(set(chat_ids))).values(state=State.TERMINATED))
+        self.core_session.execute(delete(Budget).where(Budget.budget_id.in_(set(budget_ids))))
+        self.core_session.execute(delete(Event).where(Event.event_id.in_(set(event_ids))))
+        self.core_session.execute(delete(CrontabSchedule).where(CrontabSchedule.id.in_(schedule_ids)))
+        self.core_session.execute(delete(PeriodicTask).where(PeriodicTask.id.in_(task_ids)))
 
-    def batch_terminate(self, chat_ids: list[int]) -> None:
-        """
-        Set "TERMINATED" state for the chats with given ids, and remove related budgets
-        """
-        self.core_session.execute(
-            update(Chat)
-            .where(Chat.chat_id.in_(chat_ids))
-            .values(state=State.TERMINATED)
-        )
-        self.core_session.execute(
-            delete(Budget)
-            .where(Budget.chat_id.in_(chat_ids))
-        )
-        self.core_session.commit()
-
-    def batch_delete_schedule_objects(self, schedule_ids: list[int], task_ids: list[int]) -> None:
-        self.schedule_session.execute(
-            delete(CrontabSchedule)
-            .where(CrontabSchedule.id.in_(schedule_ids))
-        )
-        self.schedule_session.execute(
-            delete(PeriodicTask)
-            .where(PeriodicTask.id.in_(task_ids))
-        )
-        self.schedule_session.commit()
+        try:
+            self.core_session.commit()
+            self.schedule_session.commit()
+            logger.info(f"Successfully terminated. Chats' state set to {State.TERMINATED}. Related db records deleted")
+        except DatabaseError as e:
+            logger.error(f"Failed to commit changes. Exception:\n{e}")
+            self.core_session.rollback()
+            self.schedule_session.rollback()
 
     def get_message(self, section: str, alias: str) -> Message:
         try:
             message = self.core_session.get(Message, (section, alias)).value
         except AttributeError as e:
-            logger.error(f"Could load message {section=}, {alias=}.\nException: {e}")
+            logger.error(f"Couldn't load message {section=}, {alias=}.\nException: {e}")
             message = config.CRITICAL_ERROR_MSG
         return message
 

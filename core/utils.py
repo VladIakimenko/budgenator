@@ -1,5 +1,3 @@
-from functools import wraps
-
 from faker import Faker
 
 
@@ -16,17 +14,3 @@ def generate_trace_phrase():
     object_ = faker.word(ext_word_list=None, part_of_speech="noun")
 
     return f"{subject_definition} {subject} {predicate} {object_}"
-
-
-def singleton(cls):
-    class _Wrapper(cls):
-        __instance = None
-
-        def __new__(cls, *args, **kwargs):
-            if _Wrapper.__instance is None:
-                instance = super().__new__(cls, *args, **kwargs)
-                cls.__init__(instance, *args, **kwargs)
-                _Wrapper.__instance = instance
-            return _Wrapper.__instance
-
-    return _Wrapper
